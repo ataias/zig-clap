@@ -899,6 +899,24 @@ fn Positionals(
         if (longest.kind != .positional)
             continue;
 
+        if ((i + 1) != fields_len and param.takes_value == .many) {
+            @compileError(
+                \\Only the last positional is allowed to take multiple values
+                \\This works:
+                \\  <usize>
+                \\  <str>
+                \\  <str>...
+                \\
+                \\This doesn't:
+                \\  <usize>
+                \\  <str>...
+                \\  <str>
+                \\
+                \\See https://github.com/Hejsil/zig-clap/issues/153
+                \\
+            );
+        }
+
         const T = ParamType(Id, param, value_parsers);
         const FieldT = switch (param.takes_value) {
             .none => continue,
