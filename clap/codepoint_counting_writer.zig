@@ -19,7 +19,7 @@ pub const CodepointCountingWriter = struct {
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Self = @alignCast(@fieldParentPtr("interface", w));
         var n_bytes_written: usize = 0;
-        var i: usize = 0;
+        var i: usize = 0; // LCOV_EXCL_LINE (kcov/DWARF artifact: drain() is called but kcov misattributes this init line with -fllvm)
 
         while (i < data.len + splat - 1) : (i += 1) {
             const chunk = data[@min(i, data.len)];
@@ -45,7 +45,7 @@ fn utf8CountCodepointsAllowTruncate(s: []const u8) !struct { bytes: usize, codep
     const N = @sizeOf(usize);
     const MASK = 0x80 * (std.math.maxInt(usize) / 0xff);
 
-    var i: usize = 0;
+    var i: usize = 0; // LCOV_EXCL_LINE (kcov/DWARF artifact: this function is called but kcov misattributes this init line with -fllvm)
     while (i < s.len) {
         // Fast path for ASCII sequences
         while (i + N <= s.len) : (i += N) {
@@ -62,7 +62,7 @@ fn utf8CountCodepointsAllowTruncate(s: []const u8) !struct { bytes: usize, codep
             i += n;
             len += 1;
         }
-    }
+    } // LCOV_EXCL_LINE
 
     return .{ .bytes = i, .codepoints = len };
 }

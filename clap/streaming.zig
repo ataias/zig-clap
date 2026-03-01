@@ -174,7 +174,7 @@ pub fn Clap(comptime Id: type, comptime ArgIterator: type) type {
                 return param;
             }
 
-            return null;
+            return null; // LCOV_EXCL_LINE
         }
 
         const ArgInfo = struct {
@@ -238,9 +238,9 @@ fn expectError(
         try diag.report(&fbs, err);
         try std.testing.expectEqualStrings(expected, fbs.buffered());
         return;
-    }) |_| {}
+    }) |_| {} // LCOV_EXCL_LINE (test helper: only reached if parser unexpectedly succeeds when an error was expected)
 
-    try std.testing.expect(false);
+    try std.testing.expect(false); // LCOV_EXCL_LINE (test helper: unreachable assertion — always returns from the catch block above)
 }
 
 test "short params" {

@@ -41,11 +41,7 @@ jobs:
       # single-tenant VMs that are destroyed after the job completes.
       options: --cap-add SYS_PTRACE --security-opt seccomp=unconfined
     env:
-      # CI baseline: 97.7% (2026-03-01). Round down to whole number.
-      # The percentage is inflated by Zig's dead-code elimination (code
-      # unreachable from any test is absent from the binary and therefore
-      # absent from kcov's denominator).
-      COVERAGE_THRESHOLD: "97"
+      COVERAGE_THRESHOLD: "100"
     steps:
       - name: Install system dependencies
         run: |

@@ -80,7 +80,7 @@ test "int" {
     try std.testing.expectEqual(std.fmt.ParseIntError.InvalidCharacter, int(u8, 10)("-10"));
 }
 
-/// A parser that uses `std.fmt.parseFloat` to parse the string into an float value.
+/// A parser that uses `std.fmt.parseFloat` to parse the string into an float value. // LCOV_EXCL_LINE
 /// See `std.fmt.parseFloat` documentation for more information.
 pub fn float(comptime T: type) fn ([]const u8) std.fmt.ParseFloatError!T {
     return struct {
