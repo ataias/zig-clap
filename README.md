@@ -397,3 +397,6 @@ const std = @import("std");
 $ zig-out/bin/usage --help
 [-hv] [--value <str>]
 ```
+
+## Notes
+- Forked from https://github.com/Hejsil/zig-clap
