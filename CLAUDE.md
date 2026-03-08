@@ -47,6 +47,13 @@ cached by a hash of the Containerfile — only rebuilt when the file changes.
 
 Report output: `zig-out/coverage/index.html`
 
+To inspect coverage results (overall percentage and uncovered lines):
+
+```bash
+python3 scripts/coverage_report.py              # auto-finds latest cobertura.xml
+python3 scripts/coverage_report.py path/to.xml   # explicit path
+```
+
 **CI:** The GitHub Actions coverage job runs in a `debian:trixie-slim` container
 with `-fllvm` (Zig's self-hosted x86 backend emits DWARF that kcov can't parse).
 Coverage threshold: **97%**.
@@ -65,6 +72,44 @@ scripts/coverage.sh         # Local coverage runner (container-based)
 Containerfile.coverage      # Container image for kcov coverage
 build.zig                   # Build configuration
 build.zig.zon               # Package manifest (v0.11.0)
+```
+
+## Formatting conventions
+
+`zig fmt` supports both single-line and multi-line struct literals. To get
+multi-line formatting, add a trailing comma after the last field. Prefer
+multi-line for struct literals with more than two fields or when any field
+value is itself a struct/complex expression:
+
+```zig
+// preferred — trailing comma triggers multi-line
+.{
+    .id = .{ .desc = "Path to workspace" },
+    .names = .{ .long = "workspace-folder" },
+    .takes_value = .one,
+    .completion = .dir_path,
+},
+
+// avoid — long single-line literals are hard to scan
+.{ .id = .{ .desc = "Path to workspace" }, .names = .{ .long = "workspace-folder" }, .takes_value = .one, .completion = .dir_path },
+```
+
+Short structs with one or two simple fields can stay on one line:
+`.{ .short = 'h', .long = "help" }`.
+
+Always use curly braces for `if`/`else`/`for`/`while` bodies, even single
+statements. `zig fmt` allows both styles but this project prefers braces for
+consistency:
+
+```zig
+// preferred
+if (res.args.help != 0) {
+    return clap.helpToFile(init.io, .stderr(), clap.Help, &params, .{});
+}
+
+// avoid
+if (res.args.help != 0)
+    return clap.helpToFile(init.io, .stderr(), clap.Help, &params, .{});
 ```
 
 ## Key patterns

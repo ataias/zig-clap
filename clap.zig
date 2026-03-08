@@ -45,6 +45,27 @@ pub const Values = enum {
     many,
 };
 
+/// Hint for shell completion generators. Tells the generator what kind of
+/// values a parameter accepts so it can emit appropriate shell-specific
+/// completion directives.
+pub const CompletionHint = union(enum) {
+    /// No hint — shell uses default word completion.
+    none,
+    /// Complete with filesystem paths (files and directories).
+    file_path,
+    /// Complete with directory paths only.
+    dir_path,
+    /// Complete with executables found in PATH.
+    executable,
+    /// Complete with a static list of allowed values.
+    values: []const []const u8,
+    /// Run an arbitrary shell command; its stdout lines become candidates.
+    /// Example: .{ .from_command = "docker ps --format '{{.Names}}'" }
+    from_command: []const u8,
+    /// Explicitly suppress completion (e.g. opaque KEY=VAL tokens).
+    none_opaque,
+};
+
 /// Represents a parameter for the command line.
 /// Parameters come in three kinds:
 ///   * Short ("-a"): Should be used for the most commonly used parameters in your program.
@@ -71,6 +92,7 @@ pub fn Param(comptime Id: type) type {
         id: Id,
         names: Names = Names{},
         takes_value: Values = .none,
+        completion: CompletionHint = .none,
     };
 }
 
@@ -604,6 +626,10 @@ pub const Diagnostic = struct {
                 "Invalid argument '{s}{s}'\n",
                 .{ longest.kind.prefix(), longest.name },
             ),
+            error.MissingPositional => try stream.print(
+                "Missing required positional argument: <{s}>\n",
+                .{diag.arg},
+            ),
             else => try stream.print("Error while parsing arguments: {s}\n", .{@errorName(err)}),
         }
     }
@@ -798,7 +824,7 @@ pub fn parseEx(
 
     var positional_count: usize = 0;
     var positionals = initPositionals(Id, params, value_parsers, .list);
-    errdefer deinitPositionals(&positionals, allocator);
+    errdefer deinitPositionals(Id, params, &positionals, allocator);
 
     var arguments = Arguments(Id, params, value_parsers, .list){};
     errdefer deinitArgs(&arguments, allocator);
@@ -889,11 +915,35 @@ pub fn parseEx(
         }
     }
 
+    // Validate that all required (.one) positionals have been provided.
+    // Skip validation when --help was requested.
+    const help_requested = if (@hasField(@TypeOf(arguments), "help")) arguments.help != 0 else false;
+    if (!help_requested) {
+        comptime var val_i: usize = 0;
+        inline for (params) |param| {
+            if (comptime param.names.longest().kind != .positional or param.takes_value == .none) {
+                continue;
+            }
+            if (param.takes_value == .one) {
+                if (positionals[val_i] == null) {
+                    if (opt.diagnostic) |diag| {
+                        diag.* = .{ .arg = param.id.value() };
+                    }
+                    return error.MissingPositional;
+                }
+            }
+            comptime {
+                val_i += 1;
+            }
+        }
+    }
+
     // We are done parsing, but our positionals are stored in lists, and not slices.
     var result_positionals: Positionals(Id, params, value_parsers, .slice) = undefined;
     inline for (&result_positionals, &positionals) |*res_pos, *pos| {
         switch (@typeInfo(@TypeOf(pos.*))) {
             .@"struct" => res_pos.* = try pos.toOwnedSlice(allocator),
+            .optional => res_pos.* = pos.* orelse std.mem.zeroes(@TypeOf(res_pos.*)), // validated non-null above; zeroed fallback for --help bypass
             else => res_pos.* = pos.*,
         }
     }
@@ -918,7 +968,7 @@ pub fn ResultEx(
 
         pub fn deinit(result: *@This()) void {
             deinitArgs(&result.args, result.allocator);
-            deinitPositionals(&result.positionals, result.allocator);
+            deinitPositionals(Id, params, &result.positionals, result.allocator);
         }
     };
 }
@@ -967,7 +1017,10 @@ fn Positionals(
         const T = ParamType(Id, param, value_parsers);
         const FieldT = switch (param.takes_value) {
             .none => continue,
-            .one => ?T,
+            .one => switch (multi_arg_kind) {
+                .list => ?T,
+                .slice => T,
+            },
             .many => switch (multi_arg_kind) {
                 .slice => []const T,
                 .list => std.ArrayListUnmanaged(T),
@@ -998,7 +1051,10 @@ fn initPositionals(
         const T = ParamType(Id, param, value_parsers);
         res[i] = switch (param.takes_value) {
             .none => continue,
-            .one => @as(?T, null),
+            .one => switch (multi_arg_kind) {
+                .list => @as(?T, null),
+                .slice => @as(T, undefined),
+            },
             .many => switch (multi_arg_kind) {
                 .slice => @as([]const T, &[_]T{}),
                 .list => std.ArrayListUnmanaged(T){},
@@ -1012,12 +1068,29 @@ fn initPositionals(
 
 /// Deinitializes a tuple of type `Positionals`. Since the `Positionals` type is generated, and we
 /// cannot add the deinit declaration to it, we declare it here instead.
-fn deinitPositionals(positionals: anytype, allocator: std.mem.Allocator) void {
-    inline for (positionals) |*pos| {
-        switch (@typeInfo(@TypeOf(pos.*))) {
-            .optional => {},
-            .@"struct" => pos.deinit(allocator), // LCOV_EXCL_LINE
-            else => allocator.free(pos.*),
+fn deinitPositionals(
+    comptime Id: type,
+    comptime params: []const Param(Id),
+    positionals: anytype,
+    allocator: std.mem.Allocator,
+) void {
+    comptime var i: usize = 0;
+    inline for (params) |param| {
+        if (comptime param.names.longest().kind != .positional or param.takes_value == .none) {
+            continue;
+        }
+        switch (param.takes_value) {
+            .none => {},
+            .one => {},
+            .many => {
+                switch (@typeInfo(@TypeOf(positionals[i]))) {
+                    .@"struct" => @constCast(&positionals[i]).deinit(allocator), // LCOV_EXCL_LINE
+                    else => allocator.free(positionals[i]),
+                }
+            },
+        }
+        comptime {
+            i += 1;
         }
     }
 }
@@ -1144,12 +1217,9 @@ test "single positional" {
 
     {
         var iter = args.SliceIterator{ .args = &.{} };
-        var res = try parseEx(Help, &params, parsers.default, &iter, .{
+        try std.testing.expectError(error.MissingPositional, parseEx(Help, &params, parsers.default, &iter, .{
             .allocator = std.testing.allocator,
-        });
-        defer res.deinit();
-
-        try std.testing.expect(res.positionals[0] == null);
+        }));
     }
 
     {
@@ -1159,7 +1229,7 @@ test "single positional" {
         });
         defer res.deinit();
 
-        try std.testing.expectEqualStrings("a", res.positionals[0].?);
+        try std.testing.expectEqualStrings("a", res.positionals[0]);
     }
 
     {
@@ -1169,7 +1239,7 @@ test "single positional" {
         });
         defer res.deinit();
 
-        try std.testing.expectEqualStrings("b", res.positionals[0].?);
+        try std.testing.expectEqualStrings("b", res.positionals[0]);
     }
 }
 
@@ -1183,38 +1253,23 @@ test "multiple positionals" {
 
     {
         var iter = args.SliceIterator{ .args = &.{} };
-        var res = try parseEx(Help, &params, parsers.default, &iter, .{
+        try std.testing.expectError(error.MissingPositional, parseEx(Help, &params, parsers.default, &iter, .{
             .allocator = std.testing.allocator,
-        });
-        defer res.deinit();
-
-        try std.testing.expect(res.positionals[0] == null);
-        try std.testing.expect(res.positionals[1] == null);
-        try std.testing.expect(res.positionals[2] == null);
+        }));
     }
 
     {
         var iter = args.SliceIterator{ .args = &.{"1"} };
-        var res = try parseEx(Help, &params, parsers.default, &iter, .{
+        try std.testing.expectError(error.MissingPositional, parseEx(Help, &params, parsers.default, &iter, .{
             .allocator = std.testing.allocator,
-        });
-        defer res.deinit();
-
-        try std.testing.expectEqual(@as(u8, 1), res.positionals[0].?);
-        try std.testing.expect(res.positionals[1] == null);
-        try std.testing.expect(res.positionals[2] == null);
+        }));
     }
 
     {
         var iter = args.SliceIterator{ .args = &.{ "1", "2" } };
-        var res = try parseEx(Help, &params, parsers.default, &iter, .{
+        try std.testing.expectError(error.MissingPositional, parseEx(Help, &params, parsers.default, &iter, .{
             .allocator = std.testing.allocator,
-        });
-        defer res.deinit();
-
-        try std.testing.expectEqual(@as(u8, 1), res.positionals[0].?);
-        try std.testing.expectEqual(@as(u8, 2), res.positionals[1].?);
-        try std.testing.expect(res.positionals[2] == null);
+        }));
     }
 
     {
@@ -1224,9 +1279,9 @@ test "multiple positionals" {
         });
         defer res.deinit();
 
-        try std.testing.expectEqual(@as(u8, 1), res.positionals[0].?);
-        try std.testing.expectEqual(@as(u8, 2), res.positionals[1].?);
-        try std.testing.expectEqualStrings("b", res.positionals[2].?);
+        try std.testing.expectEqual(@as(u8, 1), res.positionals[0]);
+        try std.testing.expectEqual(@as(u8, 2), res.positionals[1]);
+        try std.testing.expectEqualStrings("b", res.positionals[2]);
     }
 }
 
@@ -1356,6 +1411,15 @@ test "errors" {
     );
 }
 
+test "missing positional errors" {
+    const params = comptime parseParamsComptime(
+        \\<str>
+        \\
+    );
+
+    try testErr(&params, &.{}, "Missing required positional argument: <str>\n");
+}
+
 pub const Help = struct {
     desc: []const u8 = "",
     val: []const u8 = "",
@@ -1434,6 +1498,92 @@ pub fn helpToFile(
     var writer = file.writer(io, &buf);
     try help(&writer.interface, Id, params, opt);
     return writer.interface.flush();
+}
+
+/// Wrapper around `helpWithSubcommands`, which writes to a file in a buffered manner.
+pub fn helpWithSubcommandsToFile(
+    io: std.Io,
+    file: std.Io.File,
+    comptime Id: type,
+    params: []const Param(Id),
+    subcommands: []const SubcommandSpec,
+    opt: HelpOptions,
+) !void {
+    var buf: [1024]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try helpWithSubcommands(&writer.interface, Id, params, subcommands, opt);
+    return writer.interface.flush();
+}
+
+/// Like `help`, but also prints a "Commands:" section listing the given subcommands
+/// before the options. When `subcommands` is empty, this behaves identically to `help`.
+pub fn helpWithSubcommands(
+    writer: *std.Io.Writer,
+    comptime Id: type,
+    params: []const Param(Id),
+    subcommands: []const SubcommandSpec,
+    opt: HelpOptions,
+) !void {
+    if (subcommands.len > 0) {
+        try writer.writeAll("Commands:\n");
+
+        var max_name_len: usize = 0;
+        for (subcommands) |sub| {
+            if (sub.name.len > max_name_len)
+                max_name_len = sub.name.len;
+        }
+
+        for (subcommands) |sub| {
+            try writer.splatByteAll(' ', opt.indent);
+            try writer.writeAll(sub.name);
+            if (sub.description.len > 0) {
+                try writer.splatByteAll(' ', max_name_len - sub.name.len + opt.description_indent);
+                try writer.writeAll(sub.description);
+            }
+            try writer.writeAll("\n");
+        }
+
+        try writer.writeAll("\nOptions:\n");
+    }
+
+    try help(writer, Id, params, opt);
+}
+
+/// Wrapper around `helpForSubcommand`, which writes to a file in a buffered manner.
+pub fn helpForSubcommandToFile(
+    io: std.Io,
+    file: std.Io.File,
+    program_name: []const u8,
+    sub: SubcommandSpec,
+    opt: HelpOptions,
+) !void {
+    var buf: [1024]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try helpForSubcommand(&writer.interface, program_name, sub, opt);
+    return writer.interface.flush();
+}
+
+/// Print help for a single subcommand: a header line with the subcommand description,
+/// followed by its options (if any).
+pub fn helpForSubcommand(
+    writer: *std.Io.Writer,
+    program_name: []const u8,
+    sub: SubcommandSpec,
+    opt: HelpOptions,
+) !void {
+    try writer.writeAll(program_name);
+    try writer.writeAll(" ");
+    try writer.writeAll(sub.name);
+    if (sub.description.len > 0) {
+        try writer.writeAll(" - ");
+        try writer.writeAll(sub.description);
+    }
+    try writer.writeAll("\n");
+
+    if (sub.params.len > 0) {
+        try writer.writeAll("\nOptions:\n");
+        try help(writer, Help, sub.params, opt);
+    }
 }
 
 /// Print a slice of `Param` formatted as a help string to `writer`. This function expects
@@ -2083,6 +2233,85 @@ test "clap.help" {
     );
 }
 
+test "helpWithSubcommands no subcommands" {
+    const params = comptime parseParamsComptime(
+        \\-h, --help  Display help.
+        \\
+    );
+    var buf: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try helpWithSubcommands(&writer, Help, &params, &.{}, .{});
+    try std.testing.expectEqualStrings(
+        \\    -h, --help
+        \\            Display help.
+        \\
+    , writer.buffered());
+}
+
+test "helpWithSubcommands with subcommands" {
+    const params = comptime parseParamsComptime(
+        \\-h, --help  Display help.
+        \\
+    );
+    const subs = [_]SubcommandSpec{
+        .{ .name = "up", .description = "Start a container" },
+        .{ .name = "exec", .description = "Execute inside container" },
+    };
+    var buf: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try helpWithSubcommands(&writer, Help, &params, &subs, .{});
+    try std.testing.expectEqualStrings(
+        \\Commands:
+        \\    up          Start a container
+        \\    exec        Execute inside container
+        \\
+        \\Options:
+        \\    -h, --help
+        \\            Display help.
+        \\
+    , writer.buffered());
+}
+
+test "helpForSubcommand with options" {
+    const sub_params = [_]Param(Help){
+        .{ .id = .{ .desc = "Path to workspace", .val = "str" }, .names = .{ .long = "workspace-folder" }, .takes_value = .one, .completion = .dir_path },
+        .{ .id = .{ .desc = "Force overwrite" }, .names = .{ .short = 'f', .long = "force" }, .takes_value = .none },
+    };
+    const sub = SubcommandSpec{
+        .name = "up",
+        .description = "Start a container",
+        .params = &sub_params,
+    };
+    var buf: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try helpForSubcommand(&writer, "myapp", sub, .{});
+    try std.testing.expectEqualStrings(
+        \\myapp up - Start a container
+        \\
+        \\Options:
+        \\        --workspace-folder <str>
+        \\            Path to workspace
+        \\
+        \\    -f, --force
+        \\            Force overwrite
+        \\
+    , writer.buffered());
+}
+
+test "helpForSubcommand no options" {
+    const sub = SubcommandSpec{
+        .name = "version",
+        .description = "Show version",
+    };
+    var buf: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try helpForSubcommand(&writer, "myapp", sub, .{ .indent = 2, .description_on_new_line = false, .description_indent = 4 });
+    try std.testing.expectEqualStrings(
+        \\myapp version - Show version
+        \\
+    , writer.buffered());
+}
+
 /// Wrapper around `usage`, which writes to a file in a buffered manner
 pub fn usageToFile(io: std.Io, file: std.Io.File, comptime Id: type, params: []const Param(Id)) !void {
     var buf: [1024]u8 = undefined;
@@ -2229,14 +2458,424 @@ test "usage" {
     ));
 }
 
+/// Declares a subcommand for use with `SubcommandParser`.
+pub const SubcommandSpec = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    params: []const Param(Help) = &.{},
+    /// Set true for subcommands that accept a `--` passthrough (e.g. `exec`).
+    /// Remaining tokens after `--` are collected verbatim instead of being parsed as flags.
+    allow_passthrough: bool = false,
+};
+
+/// A parser that dispatches to subcommands declared at comptime.
+///
+/// Given root-level params and a list of subcommand specs, this parser:
+/// 1. Parses root-level flags until it encounters a positional (the subcommand name)
+/// 2. Dispatches the remaining arguments to the matching subcommand's param set
+/// 3. Returns a tagged union with one variant per subcommand
+pub fn SubcommandParser(
+    comptime root_params: []const Param(Help),
+    comptime subcommands: []const SubcommandSpec,
+) type {
+    if (subcommands.len == 0) @compileError("SubcommandParser requires at least one subcommand");
+
+    return struct {
+        const Self = @This();
+
+        /// A tagged union with one variant per subcommand. Each variant holds
+        /// the parsed arguments for that subcommand.
+        pub const SubcommandResult = SubcommandResultType(subcommands);
+
+        pub const RootArgs = RootArguments(root_params);
+
+        pub const ParseResult = struct {
+            root_args: RootArgs,
+            sub: SubcommandResult,
+            arena: std.heap.ArenaAllocator,
+
+            pub fn deinit(result: *ParseResult) void {
+                result.arena.deinit();
+            }
+        };
+
+        pub fn parse(
+            arguments: std.process.Args,
+            opt: ParseOptions,
+        ) !ParseResult {
+            var arena = std.heap.ArenaAllocator.init(opt.allocator);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+
+            var iter = try arguments.iterateAllocator(alloc);
+            _ = iter.next(); // skip exe arg
+
+            const result = try parseFromIter(&iter, alloc, opt.diagnostic);
+            return ParseResult{
+                .root_args = result.root_args,
+                .sub = result.sub,
+                .arena = arena,
+            };
+        }
+
+        pub fn parseFromIter(
+            iter: anytype,
+            allocator: std.mem.Allocator,
+            diagnostic: ?*Diagnostic,
+        ) !struct { root_args: RootArgs, sub: SubcommandResult } {
+            // Parse root params with terminating_positional = 0 (stop at first positional = subcommand name)
+            const subcmd_positional = [_]Param(Help){.{
+                .id = .{ .desc = "subcommand", .val = "str" },
+                .names = .{},
+                .takes_value = .one,
+            }};
+            const root_with_subcmd = root_params.ptr[0..root_params.len].* ++ subcmd_positional;
+
+            var root_res = parseEx(Help, &root_with_subcmd, parsers.default, iter, .{
+                .allocator = allocator,
+                .diagnostic = diagnostic,
+                .terminating_positional = 0,
+            }) catch |err| switch (err) {
+                error.MissingPositional => return error.MissingSubcommand,
+                else => |e| return e,
+            };
+
+            // Extract root arguments
+            var root_args: RootArgs = .{};
+            inline for (std.meta.fields(RootArgs)) |field| {
+                @field(root_args, field.name) = @field(root_res.args, field.name);
+            }
+
+            // Get the subcommand name (zeroed when --help bypassed validation)
+            const subcmd_name = root_res.positionals[0];
+            if (subcmd_name.len == 0) {
+                return error.MissingSubcommand;
+            }
+
+            // Dispatch to the matching subcommand
+            inline for (subcommands) |spec| {
+                if (std.mem.eql(u8, subcmd_name, spec.name)) {
+                    const sub_result = try parseSubcommand(spec, iter, allocator, diagnostic);
+                    return .{
+                        .root_args = root_args,
+                        .sub = @unionInit(SubcommandResult, spec.name, sub_result),
+                    };
+                }
+            }
+
+            // No matching subcommand found
+            if (diagnostic) |diag| {
+                diag.* = .{ .arg = subcmd_name };
+            }
+            return error.InvalidArgument;
+        }
+
+        fn parseSubcommand(
+            comptime spec: SubcommandSpec,
+            iter: anytype,
+            allocator: std.mem.Allocator,
+            diagnostic: ?*Diagnostic,
+        ) !SubcommandArgs(spec) {
+            var result: SubcommandArgs(spec) = .{};
+
+            if (spec.params.len == 0 and !spec.allow_passthrough) {
+                return result;
+            }
+
+            // For passthrough subcommands, add a positional <str>... to capture
+            // tokens after `--`. The streaming parser transitions to
+            // rest_are_positional mode when it sees `--`, so a positional param
+            // must exist to receive those tokens.
+            const effective_params = if (spec.allow_passthrough)
+                spec.params.ptr[0..spec.params.len].* ++ [_]Param(Help){.{
+                    .id = .{ .desc = "passthrough", .val = "str" },
+                    .names = .{},
+                    .takes_value = .many,
+                }}
+            else
+                spec.params.ptr[0..spec.params.len].*;
+
+            var sub_res = try parseEx(Help, &effective_params, parsers.default, iter, .{
+                .allocator = allocator,
+                .diagnostic = diagnostic,
+            });
+
+            // Copy named arguments (only the original spec params, not the passthrough positional)
+            const OrigArgs = Arguments(Help, spec.params, parsers.default, .slice);
+            inline for (std.meta.fields(OrigArgs)) |field| {
+                @field(result.args, field.name) = @field(sub_res.args, field.name);
+            }
+
+            // Copy positionals (parseEx already validated required ones).
+            const OrigPositionals = Positionals(Help, spec.params, parsers.default, .slice);
+            inline for (0..@typeInfo(OrigPositionals).@"struct".fields.len) |i| {
+                result.positionals[i] = sub_res.positionals[i];
+            }
+
+            // If allow_passthrough, extract the collected positional tokens
+            if (spec.allow_passthrough) {
+                const positionals = sub_res.positionals;
+                result.passthrough = positionals[positionals.len - 1];
+            }
+
+            return result;
+        }
+
+        fn SubcommandArgs(comptime spec: SubcommandSpec) type {
+            return struct {
+                args: Arguments(Help, spec.params, parsers.default, .slice) = .{},
+                positionals: Positionals(Help, spec.params, parsers.default, .slice) =
+                    initPositionals(Help, spec.params, parsers.default, .slice),
+                passthrough: if (spec.allow_passthrough) []const []const u8 else void =
+                    if (spec.allow_passthrough) &.{} else {},
+            };
+        }
+
+        /// Build the tagged union type for all subcommands.
+        fn SubcommandResultType(comptime specs: []const SubcommandSpec) type {
+            var union_fields_names: [specs.len][]const u8 = undefined;
+            var union_fields_types: [specs.len]type = undefined;
+            var enum_values: [specs.len]std.math.IntFittingRange(0, specs.len - 1) = undefined;
+
+            for (specs, 0..) |spec, i| {
+                union_fields_names[i] = spec.name ++ "";
+                union_fields_types[i] = SubcommandArgs(spec);
+                enum_values[i] = @intCast(i);
+            }
+
+            const Tag = @Enum(
+                std.math.IntFittingRange(0, specs.len - 1),
+                .exhaustive,
+                &union_fields_names,
+                &enum_values,
+            );
+
+            return @Union(.auto, Tag, &union_fields_names, &union_fields_types, &@splat(.{}));
+        }
+    };
+}
+
+/// Extract root-level named arguments (non-positional) as a simple struct.
+fn RootArguments(comptime root_params: []const Param(Help)) type {
+    return Arguments(Help, root_params, parsers.default, .slice);
+}
+
+const test_root_params = parseParamsComptime(
+    \\-h, --help  Display this help and exit.
+    \\
+);
+
+const test_add_params = parseParamsComptime(
+    \\-n, --name <str>  Name of the item
+    \\
+);
+
+const test_remove_params = parseParamsComptime(
+    \\-f, --force  Force removal
+    \\
+);
+
+const test_exec_params = parseParamsComptime(
+    \\--workspace-folder <str>  Path to workspace
+    \\
+);
+
+const test_two_subcommands = [_]SubcommandSpec{
+    .{ .name = "add", .description = "Add items", .params = &test_add_params },
+    .{ .name = "remove", .description = "Remove items", .params = &test_remove_params },
+};
+
+const test_single_subcommand = [_]SubcommandSpec{
+    .{ .name = "add", .description = "Add items" },
+};
+
+const test_exec_subcommand = [_]SubcommandSpec{
+    .{ .name = "exec", .description = "Execute a command", .params = &test_exec_params, .allow_passthrough = true },
+};
+
+test "SubcommandParser basic" {
+    const Parser = SubcommandParser(&test_root_params, &test_two_subcommands);
+
+    // Test: parse "add --name foo"
+    {
+        var iter = args.SliceIterator{
+            .args = &.{ "add", "--name", "foo" },
+        };
+        var result = try Parser.parseFromIter(&iter, std.testing.allocator, null);
+        _ = &result;
+
+        try std.testing.expectEqualStrings("foo", result.sub.add.args.name.?);
+    }
+
+    // Test: parse "remove --force"
+    {
+        var iter = args.SliceIterator{
+            .args = &.{ "remove", "--force" },
+        };
+        var result = try Parser.parseFromIter(&iter, std.testing.allocator, null);
+        _ = &result;
+
+        try std.testing.expectEqual(@as(u8, 1), result.sub.remove.args.force);
+    }
+}
+
+test "SubcommandParser unknown subcommand" {
+    const Parser = SubcommandParser(&test_root_params, &test_single_subcommand);
+
+    var iter = args.SliceIterator{
+        .args = &.{"unknown"},
+    };
+    var diag: Diagnostic = undefined;
+    const result = Parser.parseFromIter(&iter, std.testing.allocator, &diag);
+    try std.testing.expectError(error.InvalidArgument, result);
+    try std.testing.expectEqualStrings("unknown", diag.arg);
+}
+
+test "SubcommandParser no-param subcommand" {
+    const no_param_sub = [_]SubcommandSpec{
+        .{ .name = "version", .description = "Show version" },
+    };
+    const Parser = SubcommandParser(&test_root_params, &no_param_sub);
+
+    var iter = args.SliceIterator{
+        .args = &.{"version"},
+    };
+    const result = try Parser.parseFromIter(&iter, std.testing.allocator, null);
+    _ = result;
+}
+
+test "SubcommandParser passthrough" {
+    const Parser = SubcommandParser(&test_root_params, &test_exec_subcommand);
+
+    // Use an arena because parseFromIter allocates memory internally that the
+    // caller is expected to own (the passthrough slice and named arg values).
+    // In the full parse() path, an ArenaAllocator serves this role.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Test: "exec --workspace-folder /tmp -- ls -la"
+    var iter = args.SliceIterator{
+        .args = &.{ "exec", "--workspace-folder", "/tmp", "--", "ls", "-la" },
+    };
+    var result = try Parser.parseFromIter(&iter, arena.allocator(), null);
+    _ = &result;
+
+    try std.testing.expectEqualStrings("/tmp", result.sub.exec.args.@"workspace-folder".?);
+    try std.testing.expectEqual(@as(usize, 2), result.sub.exec.passthrough.len);
+    try std.testing.expectEqualStrings("ls", result.sub.exec.passthrough[0]);
+    try std.testing.expectEqualStrings("-la", result.sub.exec.passthrough[1]);
+}
+
+test "SubcommandParser flags from wrong subcommand rejected" {
+    const Parser = SubcommandParser(&test_root_params, &test_two_subcommands);
+
+    // "remove --name foo" should fail because --name is not a param of remove
+    var iter = args.SliceIterator{
+        .args = &.{ "remove", "--name", "foo" },
+    };
+    const result = Parser.parseFromIter(&iter, std.testing.allocator, null);
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
+test "SubcommandParser positionals" {
+    const math_params = comptime parseParamsComptime(
+        \\-a, --add  Add the two numbers
+        \\<isize>
+        \\<isize>
+        \\
+    );
+    const math_sub = comptime [_]SubcommandSpec{
+        .{
+            .name = "math",
+            .description = "Perform arithmetic",
+            .params = &math_params,
+        },
+    };
+    const Parser = SubcommandParser(&test_root_params, &math_sub);
+
+    var iter = args.SliceIterator{
+        .args = &.{ "math", "--add", "3", "5" },
+    };
+    var result = try Parser.parseFromIter(&iter, std.testing.allocator, null);
+    _ = &result;
+
+    try std.testing.expectEqual(@as(u8, 1), result.sub.math.args.add);
+    try std.testing.expectEqual(@as(isize, 3), result.sub.math.positionals[0]);
+    try std.testing.expectEqual(@as(isize, 5), result.sub.math.positionals[1]);
+}
+
+test "SubcommandParser missing positional" {
+    const math_params = comptime parseParamsComptime(
+        \\-a, --add  Add the two numbers
+        \\<isize>
+        \\<isize>
+        \\
+    );
+    const math_sub = comptime [_]SubcommandSpec{
+        .{
+            .name = "math",
+            .description = "Perform arithmetic",
+            .params = &math_params,
+        },
+    };
+    const Parser = SubcommandParser(&test_root_params, &math_sub);
+
+    var iter = args.SliceIterator{
+        .args = &.{ "math", "--add", "3" },
+    };
+    var diag: Diagnostic = undefined;
+    const result = Parser.parseFromIter(&iter, std.testing.allocator, &diag);
+    try std.testing.expectError(error.MissingPositional, result);
+    try std.testing.expectEqualStrings("isize", diag.arg);
+}
+
+test "SubcommandParser missing positional diagnostic message" {
+    const diag = Diagnostic{ .arg = "isize" };
+    try testDiag(diag, error.MissingPositional, "Missing required positional argument: <isize>\n");
+}
+
+test "SubcommandParser missing subcommand" {
+    const Parser = SubcommandParser(&test_root_params, &test_single_subcommand);
+
+    {
+        // --help without subcommand (help bypass path)
+        var iter = args.SliceIterator{
+            .args = &.{"--help"},
+        };
+        const result = Parser.parseFromIter(&iter, std.testing.allocator, null);
+        try std.testing.expectError(error.MissingSubcommand, result);
+    }
+
+    {
+        // No arguments at all (MissingPositional path)
+        var iter = args.SliceIterator{
+            .args = &.{},
+        };
+        const result = Parser.parseFromIter(&iter, std.testing.allocator, null);
+        try std.testing.expectError(error.MissingSubcommand, result);
+    }
+}
+
+test "SubcommandParser invalid root argument" {
+    const Parser = SubcommandParser(&test_root_params, &test_single_subcommand);
+
+    var iter = args.SliceIterator{
+        .args = &.{"--unknown"},
+    };
+    const result = Parser.parseFromIter(&iter, std.testing.allocator, null);
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
 test {
     _ = args;
     _ = parsers;
     _ = streaming;
     _ = ccw;
+    _ = complete;
 }
 
 pub const args = @import("clap/args.zig");
+pub const complete = @import("clap/complete/root.zig");
 pub const parsers = @import("clap/parsers.zig");
 pub const streaming = @import("clap/streaming.zig");
 pub const ccw = @import("clap/codepoint_counting_writer.zig");

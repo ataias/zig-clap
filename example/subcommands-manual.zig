@@ -1,16 +1,32 @@
-const main_params = clap.parseParamsComptime(
-    \\-h, --help  Display this help and exit.
-    \\
-);
+const main_params = [_]clap.Param(clap.Help){
+    .{
+        .id = .{ .desc = "Display this help and exit." },
+        .names = .{ .short = 'h', .long = "help" },
+    },
+};
 
-const math_params = clap.parseParamsComptime(
-    \\-h, --help  Display this help and exit.
-    \\-a, --add   Add the two numbers
-    \\-s, --sub   Subtract the two numbers
-    \\<isize>
-    \\<isize>
-    \\
-);
+const math_params = [_]clap.Param(clap.Help){
+    .{
+        .id = .{ .desc = "Display this help and exit." },
+        .names = .{ .short = 'h', .long = "help" },
+    },
+    .{
+        .id = .{ .desc = "Add the two numbers" },
+        .names = .{ .short = 'a', .long = "add" },
+    },
+    .{
+        .id = .{ .desc = "Subtract the two numbers" },
+        .names = .{ .short = 's', .long = "sub" },
+    },
+    .{
+        .id = .{ .val = "isize" },
+        .takes_value = .one,
+    },
+    .{
+        .id = .{ .val = "isize" },
+        .takes_value = .one,
+    },
+};
 
 const subcommand_specs = [_]clap.SubcommandSpec{
     .{
@@ -23,7 +39,7 @@ const subcommand_specs = [_]clap.SubcommandSpec{
 const Parser = clap.SubcommandParser(&main_params, &subcommand_specs);
 
 pub fn main(init: std.process.Init) !void {
-    if (try clap.complete.generateIfRequested(init, "subcommands", &main_params, &subcommand_specs)) {
+    if (try clap.complete.generateIfRequested(init, "subcommands-manual", &main_params, &subcommand_specs)) {
         return;
     }
 
@@ -47,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
     switch (res.sub) {
         .math => |math| {
             if (math.args.help != 0) {
-                return clap.helpForSubcommandToFile(init.io, .stderr(), "subcommands", subcommand_specs[0], .{});
+                return clap.helpForSubcommandToFile(init.io, .stderr(), "subcommands-manual", subcommand_specs[0], .{});
             }
 
             const a = math.positionals[0];

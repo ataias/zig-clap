@@ -14,14 +14,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     const example_step = b.step("examples", "Build examples");
-    for ([_][]const u8{
+    const example_names = [_][]const u8{
+        "complete-demo",
         "help",
         "simple",
         "simple-ex",
         "streaming-clap",
         "subcommands",
+        "subcommands-manual",
         "usage",
-    }) |example_name| {
+    };
+    var complete_demo: ?*std.Build.Step.Compile = null;
+    for (example_names) |example_name| {
         const example = b.addExecutable(.{
             .name = example_name,
             .root_module = b.createModule(.{
@@ -36,6 +40,9 @@ pub fn build(b: *std.Build) void {
         const install_example = b.addInstallArtifact(example, .{});
         example_step.dependOn(&example.step);
         example_step.dependOn(&install_example.step);
+        if (std.mem.eql(u8, example_name, "complete-demo")) {
+            complete_demo = example;
+        }
     }
 
     const docs_step = b.step("docs", "Generate docs.");
@@ -45,6 +52,15 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "docs",
     });
     docs_step.dependOn(&install_docs.step);
+
+    const test_completions_step = b.step("test-completions", "Run shell completion integration tests");
+    const demo = complete_demo orelse @panic("'complete-demo' example must be in the example_names list");
+    const fish_test = b.addSystemCommand(&.{
+        "fish",
+    });
+    fish_test.addFileArg(b.path("tests/completions/test_fish.sh"));
+    fish_test.addArtifactArg(demo);
+    test_completions_step.dependOn(&fish_test.step);
 
     const all_step = b.step("all", "Build everything and runs all tests");
     all_step.dependOn(test_step);

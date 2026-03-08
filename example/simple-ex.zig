@@ -20,6 +20,10 @@ pub fn main(init: std.process.Init) !void {
         .ANSWER = clap.parsers.enumeration(YesNo),
     };
 
+    if (try clap.complete.generateIfRequested(init, "simple-ex", &params, &.{})) {
+        return;
+    }
+
     var diag = clap.Diagnostic{};
     var res = clap.parse(clap.Help, &params, parsers, init.minimal.args, .{
         .diagnostic = &diag,
@@ -34,16 +38,21 @@ pub fn main(init: std.process.Init) !void {
     };
     defer res.deinit();
 
-    if (res.args.help != 0)
-        std.debug.print("--help\n", .{});
-    if (res.args.number) |n|
+    if (res.args.help != 0) {
+        return clap.helpToFile(init.io, .stderr(), clap.Help, &params, .{});
+    }
+    if (res.args.number) |n| {
         std.debug.print("--number = {}\n", .{n});
-    if (res.args.answer) |a|
+    }
+    if (res.args.answer) |a| {
         std.debug.print("--answer = {s}\n", .{@tagName(a)});
-    for (res.args.string) |s|
+    }
+    for (res.args.string) |s| {
         std.debug.print("--string = {s}\n", .{s});
-    for (res.positionals[0]) |pos|
+    }
+    for (res.positionals[0]) |pos| {
         std.debug.print("{s}\n", .{pos});
+    }
 }
 
 const clap = @import("clap");
