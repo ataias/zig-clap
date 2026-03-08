@@ -1543,7 +1543,9 @@ pub fn helpWithSubcommands(
             try writer.writeAll("\n");
         }
 
-        try writer.writeAll("\nOptions:\n");
+        if (params.len > 0) {
+            try writer.writeAll("\nOptions:\n");
+        }
     }
 
     try help(writer, Id, params, opt);
@@ -2529,6 +2531,7 @@ pub fn SubcommandParser(
                 .names = .{},
                 .takes_value = .one,
             }};
+            // Dereference the comptime slice into a by-value array for `++` concatenation.
             const root_with_subcmd = root_params.ptr[0..root_params.len].* ++ subcmd_positional;
 
             var root_res = parseEx(Help, &root_with_subcmd, parsers.default, iter, .{
@@ -2546,10 +2549,11 @@ pub fn SubcommandParser(
                 @field(root_args, field.name) = @field(root_res.args, field.name);
             }
 
-            // Get the subcommand name (zeroed when --help bypassed validation)
+            // When --help bypasses validation, the positional is zeroed.
+            // Return .none so callers can inspect root_args.help in the success path.
             const subcmd_name = root_res.positionals[0];
             if (subcmd_name.len == 0) {
-                return error.MissingSubcommand;
+                return .{ .root_args = root_args, .sub = .none };
             }
 
             // Dispatch to the matching subcommand
@@ -2586,6 +2590,7 @@ pub fn SubcommandParser(
             // tokens after `--`. The streaming parser transitions to
             // rest_are_positional mode when it sees `--`, so a positional param
             // must exist to receive those tokens.
+            // Dereference the comptime slice into a by-value array for `++` concatenation.
             const effective_params = if (spec.allow_passthrough)
                 spec.params.ptr[0..spec.params.len].* ++ [_]Param(Help){.{
                     .id = .{ .desc = "passthrough", .val = "str" },
@@ -2633,18 +2638,24 @@ pub fn SubcommandParser(
 
         /// Build the tagged union type for all subcommands.
         fn SubcommandResultType(comptime specs: []const SubcommandSpec) type {
-            var union_fields_names: [specs.len][]const u8 = undefined;
-            var union_fields_types: [specs.len]type = undefined;
-            var enum_values: [specs.len]std.math.IntFittingRange(0, specs.len - 1) = undefined;
+            const total = specs.len + 1;
+            var union_fields_names: [total][]const u8 = undefined;
+            var union_fields_types: [total]type = undefined;
+            var enum_values: [total]std.math.IntFittingRange(0, total - 1) = undefined;
+
+            // .none is returned when no subcommand was given (e.g. --help at root level)
+            union_fields_names[0] = "none";
+            union_fields_types[0] = void;
+            enum_values[0] = 0;
 
             for (specs, 0..) |spec, i| {
-                union_fields_names[i] = spec.name ++ "";
-                union_fields_types[i] = SubcommandArgs(spec);
-                enum_values[i] = @intCast(i);
+                union_fields_names[i + 1] = spec.name ++ "";
+                union_fields_types[i + 1] = SubcommandArgs(spec);
+                enum_values[i + 1] = @intCast(i + 1);
             }
 
             const Tag = @Enum(
-                std.math.IntFittingRange(0, specs.len - 1),
+                std.math.IntFittingRange(0, total - 1),
                 .exhaustive,
                 &union_fields_names,
                 &enum_values,
@@ -2834,26 +2845,25 @@ test "SubcommandParser missing positional diagnostic message" {
     try testDiag(diag, error.MissingPositional, "Missing required positional argument: <isize>\n");
 }
 
-test "SubcommandParser missing subcommand" {
+test "SubcommandParser --help without subcommand returns .none" {
     const Parser = SubcommandParser(&test_root_params, &test_single_subcommand);
 
-    {
-        // --help without subcommand (help bypass path)
-        var iter = args.SliceIterator{
-            .args = &.{"--help"},
-        };
-        const result = Parser.parseFromIter(&iter, std.testing.allocator, null);
-        try std.testing.expectError(error.MissingSubcommand, result);
-    }
+    var iter = args.SliceIterator{
+        .args = &.{"--help"},
+    };
+    const result = try Parser.parseFromIter(&iter, std.testing.allocator, null);
+    try std.testing.expectEqual(.none, result.sub);
+    try std.testing.expect(result.root_args.help != 0);
+}
 
-    {
-        // No arguments at all (MissingPositional path)
-        var iter = args.SliceIterator{
-            .args = &.{},
-        };
-        const result = Parser.parseFromIter(&iter, std.testing.allocator, null);
-        try std.testing.expectError(error.MissingSubcommand, result);
-    }
+test "SubcommandParser missing subcommand (no arguments)" {
+    const Parser = SubcommandParser(&test_root_params, &test_single_subcommand);
+
+    var iter = args.SliceIterator{
+        .args = &.{},
+    };
+    const result = Parser.parseFromIter(&iter, std.testing.allocator, null);
+    try std.testing.expectError(error.MissingSubcommand, result);
 }
 
 test "SubcommandParser invalid root argument" {

@@ -76,11 +76,10 @@ pub fn main(init: std.process.Init) !void {
     };
     defer res.deinit();
 
-    if (res.root_args.help != 0) {
-        return clap.helpWithSubcommandsToFile(init.io, .stdout(), clap.Help, &root_params, &subcommand_specs, .{});
-    }
-
     switch (res.sub) {
+        .none => {
+            return clap.helpWithSubcommandsToFile(init.io, .stdout(), clap.Help, &root_params, &subcommand_specs, .{});
+        },
         .up => |up| {
             if (up.args.help != 0) {
                 return clap.helpForSubcommandToFile(init.io, .stdout(), "complete-demo", subcommand_specs[0], .{});

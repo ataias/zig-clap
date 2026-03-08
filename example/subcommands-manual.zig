@@ -56,11 +56,10 @@ pub fn main(init: std.process.Init) !void {
     };
     defer res.deinit();
 
-    if (res.root_args.help != 0) {
-        return clap.helpWithSubcommandsToFile(init.io, .stderr(), clap.Help, &main_params, &subcommand_specs, .{});
-    }
-
     switch (res.sub) {
+        .none => {
+            return clap.helpWithSubcommandsToFile(init.io, .stderr(), clap.Help, &main_params, &subcommand_specs, .{});
+        },
         .math => |math| {
             if (math.args.help != 0) {
                 return clap.helpForSubcommandToFile(init.io, .stderr(), "subcommands-manual", subcommand_specs[0], .{});

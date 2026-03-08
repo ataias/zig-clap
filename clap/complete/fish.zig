@@ -88,11 +88,28 @@ fn writeCompletionHint(writer: *std.Io.Writer, hint: clap.CompletionHint) !void 
             try writer.print(" -a '", .{});
             for (vals, 0..) |val, i| {
                 if (i > 0) try writer.print(" ", .{});
-                try writer.print("{s}", .{val});
+                try writeFishEscaped(writer, val);
             }
             try writer.print("'", .{});
         },
-        .from_command => |cmd| try writer.print(" -a '({s})'", .{cmd}),
+        .from_command => |cmd| {
+            try writer.print(" -a '(", .{});
+            try writeFishEscaped(writer, cmd);
+            try writer.print(")'", .{});
+        },
+    }
+}
+
+/// Escape a string for use inside fish single-quoted strings.
+/// Fish single quotes cannot contain literal single quotes, so we end the
+/// current quote, emit an escaped quote, and re-open: `'foo'\''bar'`.
+fn writeFishEscaped(writer: *std.Io.Writer, s: []const u8) !void {
+    for (s) |c| {
+        if (c == '\'') {
+            try writer.writeAll("'\\''");
+        } else {
+            try writer.print("{c}", .{c});
+        }
     }
 }
 
@@ -162,7 +179,7 @@ test "fish: all completion hint types" {
     const expected =
         \\complete -c tool -s i -l input -r -d 'Input file' -F
         \\complete -c tool -l shell -r -d 'Shell to use' -a '(__fish_complete_command)'
-        \\complete -c tool -l name -r -d 'Container name' -a '(docker ps --format '{{.Names}}')'
+        \\complete -c tool -l name -r -d 'Container name' -a '(docker ps --format '\''{{.Names}}'\'')'
         \\
     ;
 
@@ -224,6 +241,37 @@ test "fish: with subcommands" {
         \\complete -c mycli -n '__fish_seen_subcommand_from add' -s n -l name -r -d 'Name of the item'
         \\complete -c mycli -n '__fish_seen_subcommand_from add' -s f -l force -f -d 'Force add'
         \\complete -c mycli -n '__fish_seen_subcommand_from remove' -s f -l force -f -d 'Force removal'
+        \\
+    ;
+
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+}
+
+test "fish: writeFishEscaped handles single quotes" {
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    try writeFishEscaped(&writer, "it's");
+    try std.testing.expectEqualStrings("it'\\''s", writer.buffered());
+}
+
+test "fish: values with single quotes are escaped" {
+    const params = [_]clap.Param(clap.Help){
+        .{
+            .id = .{ .desc = "Name" },
+            .names = .{ .long = "name" },
+            .takes_value = .one,
+            .completion = .{ .values = &.{ "foo", "it's", "bar" } },
+        },
+    };
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    try generate(&writer, "test", &params, &.{});
+
+    const expected =
+        \\complete -c test -l name -r -d 'Name' -a 'foo it'\''s bar'
         \\
     ;
 
